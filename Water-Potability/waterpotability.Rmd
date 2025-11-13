@@ -1,0 +1,252 @@
+---
+output: github_document
+---
+
+This notebook focuses on a dataset spanning over 3,000 observations of water samples, collecting information such as hardness levels, turbidity, potability, and more. For this study, we will be observing how various water quality variables are related to water potability.
+
+First, we load in the data and all necessary libraries.
+
+```{r}
+setwd("C:/Users/withe/OneDrive/Desktop/DIDA 380D/data")
+data_water <- read.csv("water_potability.csv")
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(car)
+library(corrplot)
+library(arm)
+library(MASS)
+library(cowplot)
+library(lmtest)
+library(sandwich)
+library(ResourceSelection)
+library(broom)
+library(rcompanion)
+```
+
+Next, we list out all the column names.
+
+```{r}
+colnames(data_water)
+```
+
+From there, we clean up all the NA values by deleting the corresponding rows. This ends up removing around 1,000 observations, giving us 2,011 clean entries.
+
+```{r}
+water_clean<-na.omit(data_water)
+```
+
+Then, we display the clean data set's distribution of variables through histograms.
+
+```{r}
+ggplot(gather(water_clean), aes(value)) + 
+    geom_histogram(bins = 50, fill = "skyblue") + 
+    facet_wrap(~key, scales = 'free') +
+    theme_light()
+```
+
+Using a prop table, we observe that around 59% of the entries are identified as non-potable, while 40% of them are potable.
+
+```{r}
+prop.table(table(water_clean$Potability))
+```
+
+We first created a linear regression model, using Potability as the dependent variable and all the other water quality indicators as the explanatory variables. Some key observations to note:
+
+-   Solids are just barely significant, with a p-value of 0.067, and a coefficient of 0.00000237
+
+-   R-squared is 0.00343, Adjusted R-Squared is -0.000554
+
+-   F-statistic is 0.861 on 2002 DF.
+
+```{r}
+
+# Disable scientific notation, ease of reading
+options(scipen = 999, digits = 4)
+
+# Linear regression model
+model <- lm(formula = Potability ~ ph + Hardness + Solids + Chloramines + Sulfate + Conductivity + Trihalomethanes + Turbidity, data = water_clean)
+
+summary(model)
+```
+
+Since we have non-constant variance and the model is heteroskedastic by nature, we use robust standard error tests to correct the model.
+
+```{r}
+coeftest(model, vcov. = vcovHC, type = "HC1")
+```
+
+Then, we create another model that observes only the relationship between water potability and solids, plotting it to observe its relationship. Due to the binary nature of potability, we determined that a linear regression doesn't make sense for this dataset. The dependent variable is linear, and the regression line doesn't seem to be constrained between 1 and 0.
+
+```{r}
+model1 <- lm(formula = Potability ~ Solids, data = water_clean)
+
+library(ggplot2)
+ggplot(water_clean , aes(x = Solids, y = Potability))+
+  geom_point()+
+  geom_smooth(method = "lm", se = T)+
+  theme_minimal()
+```
+
+Then, we create a logit model under model_logit, using the same dependent and explanatory variables. In this summary, the coefficients are interpreted as log-odds, with a 1 unit increase in x corresponding with a y increase in log-odds for y. Some key observations to note:
+
+-   Again, Solids are the only statistically significant predictor here with a p-value of 0.067 and a coefficient of 0.00000984.
+
+```{r}
+model_logit <- glm(as.integer(Potability) ~ ph + Hardness + Solids + Chloramines + Sulfate + Conductivity + Trihalomethanes + Turbidity, family = binomial(link = "logit"), data = water_clean)
+
+summary(model_logit)
+```
+
+To better interpret these results, we will exponentiate the log-odds to create coefficients that are just percentages. Interestingly, for Solids, we have:
+
+|              |               |               |             |
+|--------------|---------------|---------------|-------------|
+| **Estimate** | **Std Error** | **Statistic** | **P Value** |
+| 1.0000       | 0.000005368   | 1.83288       | 0.06682     |
+
+At an odds ratio of 1, there is no effect on Potability when observing Solids levels.
+
+```{r}
+tidy(model_logit, exp=T)
+```
+
+Then, we'll build some confidence intervals, both for log-odds and exponentiated log-odds.
+
+```{r}
+confint(model_logit)
+```
+
+All predictors include 1, showing that there is no strong evidence that any of these predictors change odds of potability.
+
+```{r}
+exp(confint(model_logit))
+```
+
+We'll check for linearity in this model to ensure that our model assumptions are valid. For the most part, all predictors seem linear, with some slight curving for Conductivity and Sulfate, which seem to be the result of some outlier values. Thus, no transformations are necessary.
+
+```{r}
+
+# Check the linearity assumption
+df_model <- water_clean %>% dplyr::select(-Potability)
+predictors <- colnames(df_model)
+df_model$probabilities <- model_logit$fitted.values
+
+# Clean up data and calculate log odds for plot against each predictor
+df_model <- df_model %>%
+  mutate(logit = log(probabilities/(1-probabilities))) %>%
+  dplyr::select(-probabilities) %>% 
+  gather(key = "predictors", value = "predictor.value", -logit) 
+
+# Plot construction
+ggplot(df_model, aes(y = logit, x = predictor.value))+
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_smooth(method = "loess") + 
+  theme_bw() + 
+  facet_wrap(~predictors, scales = "free_x")
+```
+
+Then, we'll run stepwise selection in both directions to determine which predictors to keep that will lower AIC. The results show that only Solids seem to decrease AIC (from -2863 to -2864), while all other predictors increase it.
+
+```{r}
+# Intercept-only model
+intercept_model <- lm(Potability ~ 1, data = water_clean)
+
+# Full model with all predictors
+full_model <- glm(as.integer(Potability) ~ ph + Hardness + Solids +
+  Chloramines + Sulfate + Conductivity + Trihalomethanes + Turbidity,
+  family = binomial(link = "logit"), data = water_clean)
+
+```
+
+```{r}
+# Run stepwise-selection in both directions
+both <- step(intercept_model, direction = 'both', scope = formula(full_model), trace=1)
+
+# Print out anova to compare results
+both$anova
+```
+
+We can now move on with confidence to create our second model, which now only includes Solids as the sole predictor of Potability. However, the coefficient and p-value don't seem to change meaningfully from the original model.
+
+```{r}
+model_logit2 <- glm(as.integer(Potability) ~ Solids, family = binomial(link = "logit"), data = water_clean)
+
+summary(model_logit2)
+```
+
+Exponentiating the log-odds shows that Solids still do not have a very large impact on Potability.
+
+```{r}
+tidy(model_logit2, exp=T)
+```
+
+Now, we're going to try to predict probabilities with this model. First, we generate a synthetic dataset called newdata1 that takes the mean of Solids. This shows that a water sample with average Solids level will have around a 40% chance of being potable.
+
+```{r}
+newdata1 <- with(water_clean, data.frame(Solids = mean(Solids)))
+
+
+newdata1$Potability_p <- predict(model_logit2, newdata = newdata1, type = "response")
+
+newdata1
+```
+
+After plotting predicted probabilities, the linearity assumption does not seem to be violated.
+
+```{r}
+# Plot predicted probabilities 
+library(ggeffects)
+
+Solids_atmeans <- ggpredict(model_logit2, terms = "Solids[0:65000 by = 6500]")
+plot(Solids_atmeans)
+```
+
+4/N is 4/400, or 0.01. Since the highest that this model reaches is around 0.006, which is below 0.01, no observation is extremely influential in this model. There are some high spikes, which are good to note but not extreme enough to remove from the model.
+
+```{r}
+#create a dataframe of Cook's Distance calculations
+cooks <- cooks.distance(model_logit2)
+id <- c(1:400)
+
+cooks_data <- cbind(id, cooks)
+
+#plot it
+ggplot(cooks_data, aes(x = id, y = cooks))+
+  geom_bar(stat = "identity")+
+  labs(x = "Observation Number", y = "Cook's Distance")
+```
+
+Because there are no other predictors besides Solids, the model can't suffer from multicollinearity, thus running vif() will produce an error.
+
+```{r}
+# vif(model_logit2)
+```
+
+Here, we calculate the pseudo R-squared, which show that in all three variations, the value is close to 0. This indicates that the full model is not much better than the null model, meaning the model does not explain much variation.
+
+Additionally, the function also runs a likelihood ratio test. Again, it shows that the predictor, Solids, barely explains any variation at a p-value of \~0.068
+
+```{r}
+nagelkerke(model_logit2)
+```
+
+Comparing the two logit models, the p-value is very high at 0.83, showing that the additional predictors does not improve model fit at all compared to having just Solids.
+
+```{r}
+lrtest(model_logit, model_logit2)
+```
+
+After running the Hosmer-Lemeshow Test, we can see that the p-value of 0.4 is greater than 0.05, showing that the model fails to reject the null hypothesis. This means that the logistic regression model is an acceptable fit for our data.
+
+```{r}
+hoslem.test(water_clean$Potability, fitted(model_logit2), g = 10)
+```
+
+Here we check if the probit model is any better than our logit results. It is not!
+
+```{r}
+model_probit <- glm(Potability ~ ph + Hardness + Solids + Chloramines + Sulfate + Conductivity + Trihalomethanes + Turbidity, family = binomial(link = "probit"), data = water_clean)
+
+summary(model_probit)
+```
