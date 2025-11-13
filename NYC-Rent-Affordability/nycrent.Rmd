@@ -1,0 +1,207 @@
+---
+output: github_document
+---
+
+**This project focuses on the housing affordability throughout the boroughs of New York City, analyzed through the lens of median rent prices and how neighborhood characteristics predict higher rents.**
+
+First, load in libraries.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(car)
+library(corrplot)
+library(arm)
+library(cowplot)
+```
+
+Set working directory, load in the data, and view it.
+
+```{r}
+setwd("C:/Users/withe/OneDrive/Desktop/DIDA 380D/data")
+data <- read.csv("coredata.csv")
+head(data)
+```
+
+Here, I select the variables of interest. The dependent variable is the median gross rent, and its predictors are: year, percent of total Asian, black, Hispanic, and white populations, the population density, and the amount of all major felonies committed in an area per 1,000 residents.
+
+I load it into data_clean, filtering for the years 2021-2023. I also delete City and Boroughs, since they're too broad, leaving only Sub-Boroughs and Community Districts. In this data set, these two are pretty much the same, just different methods through which governing bodies split up the NYC region. Later, they'll all be consolidated into one entry. For now, there are many duplicates which have the same region IDs. In order to better figure out how to analyze them, I select for region_id, region_name, and region_type. Region_display will be used later on to create a borough field.
+
+```{r}
+data_clean <- data %>% dplyr::select(region_id, region_display, region_name, 
+                                     region_type, year, rent_gross_med_adj,
+                                     pop_race_asian_pct,pop_race_black_pct,
+                                     pop_race_hisp_pct, pop_race_white_pct,
+                                     population_density, crime_all_rt) %>%
+  filter(year == "2023" | year == "2022" | year == "2021") %>%
+  filter(region_type != "City" & region_type != "Borough") %>%
+  arrange(region_id)
+head(data_clean)
+```
+
+Above you can see the duplicate entries for the Financial District as an example. To combine them, I grouped by region_id and year, to preserve the pair for summarize, and then summarized the duplicate entries into one. All missing values were removed and the first non-missing value was kept. Conveniently, the Community District entries had all NA fields except for the crime rate, which was all that was included. I put it all into one new data frame called data_combined.
+
+*Source: <https://stackoverflow.com/questions/67050106/how-to-combine-repeated-rows-with-missing-fields-r>*
+
+```{r}
+data_combined <- data_clean %>%
+  group_by(region_id, year) %>%
+  summarize(across(everything(), ~ first(na.omit(.x)))) %>%
+  drop_na()
+head(data_combined)
+```
+
+Then, I converted the region_displays into keeping only their borough, minus the additional number identifier. I did so by using substr(), which extracts substrings in a char. It was simple since each entry began with the abbreviated borough consisting of two letters, so I just kept the first two elements. I added these to a new column called borough.
+
+*Source: <https://www.rdocumentation.org/packages/base/versions/3.6.2/topics/substr>*
+
+```{r}
+data_combined$borough <- substr(data_combined$region_display, 1, 2)
+head(data_combined)
+```
+
+Then, I had to turn borough and year into indicator variables as they were categorical.
+
+```{r}
+data_combined <- data_combined %>% 
+  mutate(borough = as.factor(borough)) %>%
+  mutate(year = as.factor(year))
+```
+
+Then, for the purposes of cleaning up before regression, I removed the no longer needed region identifier variables.
+
+```{r}
+data_combined <- data_combined %>%
+  dplyr::select(-c(region_display, region_name, region_type))
+```
+
+In order to properly perform a regression, I needed to convert all the strings with percentages, commas, and dollar signs into plain numeric numbers. I did so by selecting the relevant columns and using gsub() to remove the characters, and then as.numeric() to convert them into a usable format. The function is applied to columns 2-8, replacing each unnecessary character with a blank space in the respective column.
+
+Source: <https://www.digitalocean.com/community/tutorials/sub-and-gsub-function-r>
+
+```{r}
+data_combined <- data_combined %>%
+  mutate(across(2:8, ~ as.numeric(gsub("[\\$,%]", "", .))))
+```
+
+I created a summary table that displayed the average statistics of each predictor and outcome as well as the median rent, grouped by the borough. It indicated that MN had the highest average rent, density, and crime rates.
+
+```{r}
+summary <- data_combined %>% 
+  group_by(borough) %>% 
+  summarise(avg_rent = mean(rent_gross_med_adj, na.rm=T),
+            med_rent = median(rent_gross_med_adj, na.rm=T),
+            avg_asian = mean(pop_race_asian_pct, na.rm=T),
+            avg_black = mean(pop_race_black_pct, na.rm=T),
+            avg_hisp = mean(pop_race_hisp_pct, na.rm=T),
+            avg_white = mean(pop_race_white_pct, na.rm=T),
+            avg_density = mean(population_density, na.rm=T),
+            avg_crime = mean(crime_all_rt, na.rm=T))
+
+summary
+```
+
+Finally, I was able to move onto the regression itself. This regression indicated that rents don't vary by much across years compared to the baseline of 2021. Asian, black, and Hispanic percentages has a significant negative impact on rent, while white percentages had a weak/uncertain effect. Interestingly, none of the other predictors were statistically significant besides being in Queens or Staten Island, which both tend to have lower rents than Manhattan. The R-squared values indicate that \~52% of variation in rents is explained by the model, and doesn't include too many predictors. The F-statistic indicates a high value with a small p-value, meaning the model performs poorly against the null hypothesis, rejecting it.
+
+```{r}
+model <- lm(rent_gross_med_adj ~ year + pop_race_asian_pct + pop_race_black_pct + pop_race_hisp_pct + pop_race_white_pct + population_density + crime_all_rt + borough, data = data_combined)
+summary(model)
+```
+
+The residuals vs fitted plot has a relatively straight line, meaning the outcome and predictor have a linear relationship. The QQ plot indicates that there is some non-normality in the predictors of the model due to the curving off at the ends. The scale-location plot indicates a slight upward curve, but otherwise has an acceptable homogeneity of variance. Lastly, the residuals vs leverage plot shows that there aren't any outliers in the data that significantly impact the model.
+
+```{r}
+plot(model)
+```
+
+To test for multicollinearity, I used vif() on the model. I found that the race population percentages had extremely high values of GVIF, indicating that they were extremely predictable with each other. This makes sense, as each percentage takes away from the other. In order to fix this, I'll drop white percentage from the model so that every other percentage uses it as a baseline instead of depending on one another.
+
+```{r}
+vif(model)
+```
+
+In order to check for normality, I created histograms for each predictor and the outcome. I noticed some of them like crime or black pct were heavily skewed, while most of them were relatively flat.
+
+```{r}
+hist_data <- data_combined %>% dplyr::select(pop_race_asian_pct,pop_race_black_pct,pop_race_hisp_pct, population_density,crime_all_rt, rent_gross_med_adj)
+
+ggplot(gather(hist_data), aes(value)) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    facet_wrap(~key, scales = 'free_x')+
+    theme_dark()
+```
+
+I ran a boxcox() function on all predictors and the outcome to determine the best transformation to make them more normal. Most of them either indicated that they required logs or a sqrt.
+
+```{r}
+boxcox(lm(pop_race_asian_pct~1, data = data_combined))
+boxcox(lm(pop_race_black_pct~1, data = data_combined))
+boxcox(lm(pop_race_hisp_pct~1, data = data_combined))
+boxcox(lm(population_density~1, data = data_combined))
+boxcox(lm(crime_all_rt~1, data = data_combined))
+boxcox(lm(rent_gross_med_adj~1, data = data_combined))
+```
+
+I tested all the possible likely transformations, and landed on the following to make the plots more normal.
+
+```{r}
+a <- ggplot(hist_data, aes(log(pop_race_asian_pct))) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    theme_dark()
+
+b <- ggplot(hist_data, aes(log(pop_race_black_pct))) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    theme_dark()
+
+c <- ggplot(hist_data, aes(log(pop_race_hisp_pct))) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    theme_dark()
+
+d <- ggplot(hist_data, aes(log(population_density))) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    theme_dark()
+
+e <- ggplot(hist_data, aes(log(crime_all_rt))) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    theme_dark()
+
+f <- ggplot(hist_data, aes(log(rent_gross_med_adj))) + 
+    geom_histogram(bins = 30, fill = "skyblue") + 
+    theme_dark()
+
+plot_grid(a, b, c, d, e, f,
+          nrow = 2,
+          labels = c("A", "B", "C", "D", "E", "F"))
+```
+
+The new model mostly indicates a slight improvement in the QQ plot, scale-location, and the leverage plot. The points are less clustered on the leverage plot and the scale-location plot doesn't curve up as much anymore.
+
+```{r}
+model2 <- lm(log(rent_gross_med_adj) ~ year + log(pop_race_asian_pct) + log(pop_race_black_pct) + log(pop_race_hisp_pct) + log(population_density) + log(crime_all_rt) + borough, data = data_combined)
+plot(model2)
+```
+
+Here, I confirmed that the new model doesn't have any crazy multicollinearity issues.
+
+```{r}
+vif(model2)
+```
+
+The new model now assumes a baseline of white populations in Manhattan in 2021. While only the black percentage, Hispanic percentage, and crime percentages have a significant effect on rent, it seems that population density and borough location does not play as big of a role. It's also interesting that being in Staten Island and Asian percentages mattered less after controlling for these other transformed factors.
+
+```{r}
+summary(model2)
+```
+
+```{r}
+hist_data %>%
+    mutate(id = row_number()) %>%
+    gather(variable, value, -id, -rent_gross_med_adj) %>%
+    ggplot(aes(y = rent_gross_med_adj, x = log(value)))+
+    geom_point(color = "green3")+
+    geom_smooth(method = "lm", color = "black")+
+    facet_wrap(~variable, scales = "free_x")+
+    theme_dark()+
+    labs(y = "Gross Rent", x = "Variable")
+```
